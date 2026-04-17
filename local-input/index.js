@@ -1,127 +1,187 @@
-const { Kafka } = require('kafkajs');
-const fs = require('fs');
-const path = require('path');
-const csv = require('csv-parser');
+const { Kafka } = require("kafkajs");
+const fs = require("fs");
+const path = require("path");
+const csv = require("csv-parser");
+const {
+  createLogger,
+  config,
+  Errors,
+  runWithConcurrencyLimit,
+} = require("../lib");
 
-// Kafka configuration
-const kafka = new Kafka({
-  clientId: 'csv-producer',
-  brokers: ['localhost:9092'], // Default Kafka broker address
-});
+config.csvDir = config.csvDir || __dirname;
+const logger = createLogger(config.clientId);
 
-const producer = kafka.producer();
+const kafka = new Kafka({ clientId: config.clientId, brokers: config.brokers });
+const producer = kafka.producer({ idempotent: true });
 
-// Function to read and process a single CSV file
-async function processCSVFile(filePath) {
-  return new Promise((resolve, reject) => {
-    const results = [];
+async function processCSVFile(filePath, partitionIndex, totalFiles) {
+  const filename = path.basename(filePath);
+  let batch = [];
+  let rowIndex = 0;
+  let csvHeaders = [];
 
-    fs.createReadStream(filePath)
-      .pipe(csv())
-      .on('data', (data) => {
-        results.push(data);
-      })
-      .on('end', () => {
-        console.log(`Processed ${results.length} rows from ${path.basename(filePath)}`);
-        resolve(results);
-      })
-      .on('error', (error) => {
-        console.error(`Error reading ${filePath}:`, error);
-        reject(error);
+  const flush = (messages) => producer.send({ topic: config.topic, messages });
+
+  await new Promise((resolve, reject) => {
+    const readable = fs.createReadStream(filePath);
+    const stream = readable.pipe(csv());
+
+    const abort = (err) => {
+      readable.destroy();
+      stream.destroy();
+      reject(err);
+    };
+
+    stream.on("headers", (headers) => {
+      csvHeaders = headers;
+    });
+
+    stream.on("data", (row) => {
+      if (!row || Object.keys(row).length === 0) {
+        logger.warn("dropping_empty_row", { file: filename, rowIndex });
+        return;
+      }
+      batch.push({
+        key: String(rowIndex++),
+        value: JSON.stringify(row),
+        headers: { source: filename },
+        partition: partitionIndex,
       });
+
+      if (batch.length >= config.batchSize) {
+        stream.pause();
+        const toSend = batch;
+        batch = [];
+        flush(toSend)
+          .then(() => stream.resume())
+          .catch((err) => abort(Errors.kafkaSendError(filename, err)));
+      }
+    });
+
+    stream.on("end", resolve);
+    stream.on("error", (err) => abort(Errors.fileReadError(filename, err)));
+    readable.on("error", (err) => abort(Errors.fileReadError(filename, err)));
+  });
+
+  if (batch.length > 0) await flush(batch);
+
+  await flush([
+    {
+      key: "eof",
+      value: null,
+      headers: {
+        source: filename,
+        eof: "true",
+        csvHeaders: csvHeaders.join(","),
+        totalFiles: String(totalFiles),
+      },
+      partition: partitionIndex,
+    },
+  ]);
+
+  logger.info("file_sent", {
+    file: filename,
+    partition: partitionIndex,
+    rows: rowIndex,
   });
 }
 
-// Function to send messages to Kafka
-async function sendToKafka(messages, sourceFile) {
-  try {
-    const kafkaMessages = messages.map((message, index) => ({
-      key: `${path.basename(sourceFile)}-${index}`, // Use filename and row index as key
-      value: JSON.stringify(message),
-      headers: {
-        source: path.basename(sourceFile),
-        timestamp: new Date().toISOString()
-      }
-    }));
-
-    await producer.send({
-      topic: 'raw-transactions',
-      messages: kafkaMessages
-    });
-
-    console.log(`Successfully sent ${kafkaMessages.length} messages from ${path.basename(sourceFile)} to raw-transactions topic`);
-  } catch (error) {
-    console.error(`Error sending messages from ${sourceFile}:`, error);
-    throw error;
-  }
-}
-
-// Main function
 async function main() {
-  try {
-    console.log('Starting CSV to Kafka producer...');
+  await producer.connect();
+  logger.info("connected", { brokers: config.brokers, topic: config.topic });
 
-    // Connect to Kafka
-    await producer.connect();
-    console.log('Connected to Kafka');
+  const csvFiles = fs
+    .readdirSync(config.csvDir)
+    .filter((filename) => filename.endsWith(config.csvExtension))
+    .sort()
+    .map((filename) => path.join(config.csvDir, filename));
 
-    // Find all CSV files in the current directory
-    const csvFiles = fs.readdirSync(__dirname)
-      .filter(file => file.endsWith('.csv'))
-      .map(file => path.join(__dirname, file));
-
-    if (csvFiles.length === 0) {
-      console.log('No CSV files found in the current directory');
-      return;
-    }
-
-    console.log(`Found ${csvFiles.length} CSV files:`, csvFiles.map(f => path.basename(f)));
-
-    // Process each CSV file
-    for (const csvFile of csvFiles) {
-      console.log(`\nProcessing ${path.basename(csvFile)}...`);
-
-      try {
-        const rows = await processCSVFile(csvFile);
-
-        if (rows.length > 0) {
-          await sendToKafka(rows, csvFile);
-        } else {
-          console.log(`No data rows found in ${path.basename(csvFile)}`);
-        }
-      } catch (error) {
-        console.error(`Failed to process ${csvFile}:`, error);
-        // Continue with other files even if one fails
-      }
-    }
-
-    console.log('\nAll CSV files processed successfully!');
-
-  } catch (error) {
-    console.error('Error in main process:', error);
-  } finally {
-    // Disconnect from Kafka
+  if (csvFiles.length === 0) {
+    const err = Errors.noFilesFound(config.csvDir, config.csvExtension);
+    logger.warn("no_files_found", err.meta);
     await producer.disconnect();
-    console.log('Disconnected from Kafka');
+    return;
+  }
+
+  const admin = kafka.admin();
+  await admin.connect();
+  try {
+    const metadata = await admin.fetchTopicMetadata({ topics: [config.topic] });
+    const topicMeta = metadata.topics.find((t) => t.name === config.topic);
+    const partitionsCount = topicMeta ? topicMeta.partitions.length : 0;
+
+    if (csvFiles.length > partitionsCount) {
+      const err = Errors.insufficientPartitions(csvFiles.length, partitionsCount);
+      logger.error("fatal_infrastructure_error", err.meta);
+      throw err;
+    }
+  } finally {
+    await admin.disconnect();
+  }
+
+  logger.info("processing_start", {
+    files: csvFiles.map((filePath) => path.basename(filePath)),
+    batchSize: config.batchSize,
+    concurrencyLimit: config.concurrencyLimit,
+  });
+
+  const tasks = csvFiles.map(
+    (filePath, index) => () => processCSVFile(filePath, index, csvFiles.length),
+  );
+  const results = await runWithConcurrencyLimit(tasks, config.concurrencyLimit);
+
+  const failures = results
+    .map((result, index) => ({
+      ...result,
+      file: path.basename(csvFiles[index]),
+    }))
+    .filter((result) => result.status === "rejected");
+
+  if (failures.length > 0) {
+    failures.forEach((failure) =>
+      logger.error("file_failed", {
+        file: failure.file,
+        error: failure.reason.message,
+      }),
+    );
+  }
+
+  logger.info("all_files_complete", {
+    totalFiles: csvFiles.length,
+    succeeded: csvFiles.length - failures.length,
+    failed: failures.length,
+  });
+  await producer.disconnect();
+}
+
+async function shutdown() {
+  try {
+    await producer.disconnect();
+  } catch (err) {
+    logger.error("shutdown_error", { error: err.message });
   }
 }
 
-// Handle graceful shutdown
-process.on('SIGINT', async () => {
-  console.log('\nReceived SIGINT, shutting down gracefully...');
-  await producer.disconnect();
+process.on("SIGINT", async () => {
+  await shutdown();
+  process.exit(0);
+});
+process.on("SIGTERM", async () => {
+  await shutdown();
   process.exit(0);
 });
 
-process.on('SIGTERM', async () => {
-  console.log('\nReceived SIGTERM, shutting down gracefully...');
-  await producer.disconnect();
-  process.exit(0);
-});
-
-// Run the main function
 if (require.main === module) {
-  main().catch(console.error);
+  main().catch((err) => {
+    logger.error("fatal", {
+      code: err.code || "UNKNOWN",
+      error: err.message,
+      stack: err.stack,
+      ...err.meta,
+    });
+    process.exit(1);
+  });
 }
 
-module.exports = { main, processCSVFile, sendToKafka };
+module.exports = { main, processCSVFile };
