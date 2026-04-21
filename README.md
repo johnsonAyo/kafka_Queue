@@ -1,4 +1,3 @@
-# Principal Data Engineer Technical Test
 
 ## Overview
 
